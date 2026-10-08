@@ -38,7 +38,7 @@
      collapses rows that are identical across the selected fields — without a
      unique key the feed returns ~half the leads. It is not copied into the
      page payload. */
-  var URL_ZOHO = endpoint('zoho',       'date,leads_id,leads_lead_source,leads_lead_status,leads_course_interested,leads_course_fee', '2021-10-08');
+  var URL_ZOHO = endpoint('zoho',       'date,leads_id,leads_lead_source,leads_lead_status,leads_course_interested,leads_course_fee,leads_converted_date', '2021-10-08');
 
   var num  = function(v){ var x = parseFloat(String(v==null?'':v).replace(/,/g,'')); return isFinite(x)?x:0; };
   var fee  = function(v){ var m = String(v==null?'':v).replace(/,/g,'').match(/\d+(?:\.\d+)?/); return m?parseFloat(m[0]):0; };
@@ -65,7 +65,7 @@
          emails and mobiles, disability and medical flags, prior education — is
          never requested, and is dropped here even if the feed returns it. */
       var ZOHO_ALLOW = ['date','leads_id','leads_lead_source','leads_lead_status',
-                        'leads_course_interested','leads_course_fee'];
+                        'leads_course_interested','leads_course_fee','leads_converted_date'];
       zoho = zoho.map(function(r){
         var clean = {};
         for(var i=0;i<ZOHO_ALLOW.length;i++){
@@ -119,11 +119,17 @@
         if(status === 'Converted'){
           b.converted++;
           var f = fee(r.leads_course_fee), c = course || '(unspecified)';
-          /* No conversion date exists in this feed (leads_converted_date_time is
-             empty and leads_modified_time is a bulk-edit stamp), so enrolments are
-             dated by LEAD-CREATED date. `cr` is deliberately omitted so the
-             sales-cycle section reports "no data" rather than a false 0 days. */
-          records.push({ d:date, c:c, f:f, s:source });
+          /* Two dates per enrolment, because the business reads them two ways:
+               d  = conversion date  — when the student actually enrolled and paid.
+                    Sales basis: enrolment counts, seats, "revenue booked".
+               ld = lead-created date — the month whose ad budget bought the lead.
+                    Marketing basis: ROAS, revenue-vs-spend, revenue trend.
+             A lead created Oct 2025 that converts Mar 2026 is March revenue to
+             sales, but its ROAS belongs to October 2025's spend.
+             `cr` is omitted so the sales-cycle section reports "no data" rather
+             than guessing a cycle length from dates Zoho fills inconsistently. */
+          var cd = String(r.leads_converted_date || '').slice(0,10) || date;
+          records.push({ d:cd, ld:date, c:c, f:f, s:source });
           courseTot[c] = (courseTot[c]||0) + 1;
           courseRev[c] = (courseRev[c]||0) + f;
         }
@@ -1038,7 +1044,8 @@ function windowMetrics(from,to){ const inR=iso=>{ const d=iso&&String(iso).slice
   ((WIN_LIGHT&&WIN_LIGHT.ads)||[]).forEach(a=>{ if(inR(a.date)&&adPass(a)){ const sp=a.spend||0; spend+=sp; if(a.source==='Meta')meta+=sp; else if(a.source==='Google')goog+=sp; } });
   ((WIN_LIGHT&&WIN_LIGHT.leads)||[]).forEach(l=>{ if(inR(l.date||l.createdTime)&&leadSel(l)){ leads++; } });
   // Conversions = enrolments, booked by conversion date (r.d) — full-history ledger.
-  ((ENROLL&&ENROLL.records)||[]).forEach(r=>{ if(inR(r.d)){ enrolled++; conv++; revenue+=r.f||0; } });
+  ((ENROLL&&ENROLL.records)||[]).forEach(r=>{ if(inR(r.d)){ enrolled++; conv++; }
+    const _ld=r.ld||r.d; if(inR(_ld)) revenue+=r.f||0; });   // revenue on the MARKETING basis
   const lm=leadMinDate(); return { spend,meta,goog,leads,conv,enrolled,revenue, leadsAvail:!(lm && from<lm) }; }
 // Previous-window breakdowns for the section data points (channels / lead sources /
 // campaign spend). Channel leads honour the Google+Website fold, matching render().
@@ -1446,7 +1453,8 @@ function trendAgg(from,to,interval){ const seq=bucketSeq(from,to,interval);
   ((WIN_LIGHT&&WIN_LIGHT.ads)||[]).forEach(a=>{ if(inR(a.date)&&adPass(a)) add(a.date,b=>{ b.spend+=a.spend||0; b.impr+=a.impressions||0; b.clicks+=a.clicks||0; }); });
   ((WIN_LIGHT&&WIN_LIGHT.leads)||[]).forEach(l=>{ const dt=l.date||l.createdTime; if(inR(dt)&&leadSel(l)) add(dt,b=>{ b.leads++; }); });
   // Conversions & enrolments are the same event — booked by conversion date (r.d).
-  ((ENROLL&&ENROLL.records)||[]).forEach(r=>{ if(inR(r.d)) add(r.d,b=>{ b.enrolled++; b.conv++; b.revenue+=r.f||0; }); });
+  ((ENROLL&&ENROLL.records)||[]).forEach(r=>{ if(inR(r.d)) add(r.d,b=>{ b.enrolled++; b.conv++; });
+    const _ld=r.ld||r.d; if(inR(_ld)) add(_ld,b=>{ b.revenue+=r.f||0; }); });   // revenue credited to the lead's own month
   return seq.map(s=>map.get(s.key)); }
 // Vertical dashed divider between the previous and current halves of the compare chart.
 function trendDivider(splitIdx, days){ return { id:'cmpdiv', afterDraw(chart){
@@ -2667,8 +2675,16 @@ function render(d, win){
   // Paid-ads-only revenue (leads sourced directly from Meta / Google ads) — powers the ROI card's "paid ads only" toggle.
   const _isPaidSrc = s => META_SRC.has(s) || GOOG_SRC.has(s);
   let cumRevPaid=0, cumTotalPaid=0, deltaRevPaid=0;
+  // Marketing-attributed revenue: credited to the month the LEAD was created — the
+  // month whose ad spend actually bought it — rather than the month it converted.
+  // Feeds ROAS and the revenue-vs-spend band only; enrolments, seats and "revenue
+  // booked" above stay on the conversion date (r.d), which is the sales reality.
+  let cumRevMkt=0, deltaRevMkt=0, cumRevPaidMkt=0, deltaRevPaidMkt=0;
   ((ENROLL && Array.isArray(ENROLL.records)) ? ENROLL.records : []).forEach(r=>{
     const paid=_isPaidSrc(r.s);
+    const _ld=r.ld||r.d;
+    if(_inBase(_ld)){ cumRevMkt+=(r.f||0); if(paid) cumRevPaidMkt+=(r.f||0); }
+    if(rangeActive() && inRange(_ld)){ deltaRevMkt+=(r.f||0); if(paid) deltaRevPaidMkt+=(r.f||0); }
     if(_inBase(r.d)){ cumByCourse[r.c]=(cumByCourse[r.c]||0)+1; cumRevByCourse[r.c]=(cumRevByCourse[r.c]||0)+(r.f||0); cumTotal++; cumRev+=(r.f||0); if(paid){ cumRevPaid+=(r.f||0); cumTotalPaid++; } }
     if(rangeActive() && inRange(r.d)){ deltaByCourse[r.c]=(deltaByCourse[r.c]||0)+1; deltaTotal++; deltaRev+=(r.f||0); if(paid) deltaRevPaid+=(r.f||0); }
   });
@@ -2698,9 +2714,9 @@ function render(d, win){
   let baseSpend=0; const baseByCh={}; ((WIN_LIGHT&&WIN_LIGHT.ads)||[]).forEach(a=>{ if(_inBase(a.date)&&adPass(a)){ baseSpend+=a.spend||0; const s=a.source||'?'; baseByCh[s]=(baseByCh[s]||0)+(a.spend||0); } });
   const hasSpend = d.spend>0;               // any spend in the selected period (flow card)
   const hasSpendAll = baseSpend>0;
-  const zRoas  = hasSpendAll ? zRev/baseSpend : 0;
+  const zRoas  = hasSpendAll ? cumRevMkt/baseSpend : 0;   // MARKETING basis
   const roasStr = hasSpendAll ? zRoas.toFixed(1)+'×' : '—';
-  const zNet   = zRev - baseSpend;
+  const zNet   = cumRevMkt - baseSpend;   // MARKETING basis
   const _topCourse = Object.entries(cumRevByCourse).sort((a,b)=>b[1]-a[1])[0];
   const topName = _topCourse ? _topCourse[0] : (d.topRev[0] && d.topRev[0].name);
   const topAmt  = _topCourse ? _topCourse[1] : ((d.topRev[0] && d.topRev[0].secured) || 0);
@@ -2708,16 +2724,16 @@ function render(d, win){
   const totWord = _bw ? 'in '+_bw.year : 'all-time';   // headline scope: "in 2026" / "all-time"
   const showDelta = !!_bw && (DATE_RANGE.from||'') > _bw.from;   // the period is a sub-window of its year
   // Period ROAS: tuition enrolled in the selected window ÷ ad spend in that window.
-  const periodRoas = (showDelta && d.spend>0) ? (newRevenue/d.spend) : null;
+  const periodRoas = (showDelta && d.spend>0) ? (deltaRevMkt/d.spend) : null;   // MARKETING basis
   const periodRoasStr = periodRoas!=null ? periodRoas.toFixed(1)+'×' : null;
   // ROI card "paid ads only" mode — needs the per-enrolment lead source (r.s); hidden until a fresh pull carries it.
   const roiHasSrc = !!(ENROLL && Array.isArray(ENROLL.records) && ENROLL.records.some(r=>r.s));
   const roiPaid = ROI_PAID_ONLY && roiHasSrc;
-  const roiRev  = roiPaid ? cumRevPaid : zRev;
+  const roiRev  = roiPaid ? cumRevPaidMkt : cumRevMkt;   // MARKETING basis
   const roiRoas = hasSpendAll ? roiRev/baseSpend : 0;
   const roiRoasStr = hasSpendAll ? roiRoas.toFixed(1)+'×' : '—';
   const roiNet  = roiRev - baseSpend;
-  const roiNewRev = roiPaid ? deltaRevPaid : newRevenue;
+  const roiNewRev = roiPaid ? deltaRevPaidMkt : deltaRevMkt;   // MARKETING basis
   const roiPeriodRoas = (showDelta && d.spend>0) ? (roiNewRev/d.spend) : null;
   const roiPeriodRoasStr = roiPeriodRoas!=null ? roiPeriodRoas.toFixed(1)+'×' : null;
   const roiRevLab = roiPaid ? 'Revenue booked · paid ads only' : 'Revenue booked (CRM)';
@@ -3117,13 +3133,14 @@ const PRES=(function(){
     const from=active?cw.from:(bw?bw.from:DATA_MIN), to=active?cw.to:(bw?bw.to:DATA_MAX);
     const periodTxt=active&&cw?fmtRange(cw.from,cw.to):'Program to date';
     const yr=to?String(to).slice(0,4):'';
-    let cumN=0,cumRev=0,dltN=0,dltRev=0; const bc={};
+    let cumN=0,cumRev=0,dltN=0,dltRev=0,cumRevMkt=0; const bc={};
     ((ENROLL&&ENROLL.records)||[]).forEach(r=>{ const inB=!bw||(r.d>=bw.from&&r.d<=bw.to);
       if(inB){ cumN++; cumRev+=r.f||0; (bc[r.c]=bc[r.c]||{n:0,rev:0}); bc[r.c].n++; bc[r.c].rev+=r.f||0; }
-      if(active&&inRange(r.d)){ dltN++; dltRev+=r.f||0; } });
+      if(active&&inRange(r.d)){ dltN++; dltRev+=r.f||0; }
+      const _ld=r.ld||r.d; if(!bw||(_ld>=bw.from&&_ld<=bw.to)) cumRevMkt+=r.f||0; });
     const courseRev=Object.entries(bc).map(([c,v])=>({label:c,n:v.n,value:v.rev,sub:'· '+v.n+' seat'+(v.n!==1?'s':'')})).sort((a,b)=>b.value-a.value);
     let baseSpend=0; ((WIN_LIGHT&&WIN_LIGHT.ads)||[]).forEach(a=>{ const inB=!bw||(a.date>=bw.from&&a.date<=bw.to); if(inB&&adSel(a)) baseSpend+=a.spend||0; });
-    const roas=baseSpend?cumRev/baseSpend:0, net=cumRev-baseSpend;
+    const roas=baseSpend?cumRevMkt/baseSpend:0, net=cumRevMkt-baseSpend;   // MARKETING basis
     const pw=active?prevWindow():null, base=pw?scaleMetrics(windowMetrics(pw.from,pw.to),pw.scale):null;
     const cmpTxt=pw?(pw.label+' · '+rangeShort(pw.from,pw.to)):'';
     const budTotal=DATA.budTotal||0,budSpent=DATA.budSpent||0,budRemain=DATA.budRemain||0,budPct=budTotal?budSpent/budTotal*100:0;
