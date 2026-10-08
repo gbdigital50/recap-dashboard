@@ -34,7 +34,13 @@ const url = (ep, fields, from) =>
   `${CONN}/${ep}?date_from=${from}&date_to=${TODAY}&fields=${fields}&api_key=${KEY}`;
 
 const SOURCES = {
-  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend', '2023-10-08'),
+  // actions_lead = Meta's own reported lead count per ad. This is the platform's
+  // number, not the CRM's — it counts form submissions at the ad, so it runs
+  // higher than Zoho's lead records and is only used for the ad-level drill
+  // (leads / cost-per-lead per creative). Google's `conversions` is deliberately
+  // not mapped: it returns every configured conversion action (~74k over two
+  // months), which is not a lead count, so Google stays campaign-level only.
+  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend,actions_lead', '2023-10-08'),
   google: url('google_ads', 'date,campaign,clicks,spend,impressions', '2021-10-08'),
   zoho: url('zoho', ZOHO_FIELDS.join(','), '2021-10-08'),
 };
@@ -152,8 +158,9 @@ for (const r of meta) {
     e = { campaign, adSet, adName, year: y - 2000, month: mo, spend: 0, clicks: 0, leads: 0, impressions: 0, days: [], firstDate: date, lastDate: date };
     dmap.set(k, e);
   }
-  e.spend += num(r.spend); e.clicks += num(r.clicks); e.impressions += num(r.impressions);
-  e.days.push({ d: date, s: num(r.spend), c: num(r.clicks), l: 0, i: num(r.impressions) });
+  const lds = num(r.actions_lead);
+  e.spend += num(r.spend); e.clicks += num(r.clicks); e.impressions += num(r.impressions); e.leads += lds;
+  e.days.push({ d: date, s: num(r.spend), c: num(r.clicks), l: lds, i: num(r.impressions) });
   if (date < e.firstDate) e.firstDate = date;
   if (date > e.lastDate) e.lastDate = date;
 }
