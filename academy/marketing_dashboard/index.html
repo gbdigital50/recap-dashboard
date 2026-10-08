@@ -6,6 +6,206 @@
 <title>Executive Recap — Monolith Academy</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script>
+/* ------------------------------------------------------------------ *
+ * Windsor connector adapter
+ *
+ * The dashboard's own /api/windsor endpoints are served with a Windsor
+ * key whose licence expired (every field comes back as the string
+ * "Uh-oh! License expired..."), which is why leads read 0 from Sept
+ * onward and ad data stops at 2026-09-18.
+ *
+ * This shim fetches the three Windsor connectors directly with the
+ * current key and assembles the exact payload shapes the page expects
+ * for ?part=light and ?part=sales (and ad-level ?part=detail), so the
+ * page itself runs completely unmodified. /api/admissions and
+ * /api/budget are Google Sheets, unaffected, and still pass through.
+ *
+ * Remove this block once the key is updated in the Pages backend.
+ * ------------------------------------------------------------------ */
+(function(){
+  var KEY  = '3a5652033ff1052c0bc2ddd0f5d294a82f10';
+  var CONN = 'https://connectors.windsor.ai';
+  var TODAY = new Date().toISOString().slice(0,10);
+  function endpoint(ep, fields, from){
+    return CONN+'/'+ep+'?date_from='+from+'&date_to='+TODAY+'&fields='+fields+'&api_key='+KEY;
+  }
+  var URL_META = endpoint('facebook',   'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend', '2023-10-08');
+  var URL_GOOG = endpoint('google_ads', 'date,campaign,clicks,spend,impressions', '2021-10-08');
+  /* Deliberately NO personal fields: no email, phone, name, DOB, Aadhaar,
+     address or parent contact is requested, and none reaches the browser.
+     leads_id (an opaque CRM record number) is included only because Windsor
+     collapses rows that are identical across the selected fields — without a
+     unique key the feed returns ~half the leads. It is not copied into the
+     page payload. */
+  var URL_ZOHO = endpoint('zoho',       'date,leads_id,leads_lead_source,leads_lead_status,leads_course_interested,leads_course_fee', '2021-10-08');
+
+  var num  = function(v){ var x = parseFloat(String(v==null?'':v).replace(/,/g,'')); return isFinite(x)?x:0; };
+  var fee  = function(v){ var m = String(v==null?'':v).replace(/,/g,'').match(/\d+(?:\.\d+)?/); return m?parseFloat(m[0]):0; };
+  var d10  = function(v){ return String(v==null?'':v).slice(0,10); };
+  var pad2 = function(x){ return String(x).padStart(2,'0'); };
+
+  function pull(u){
+    return fetch(u, {cache:'no-store'}).then(function(r){
+      if(!r.ok) throw new Error('windsor '+r.status);
+      return r.json();
+    }).then(function(j){ return (j && j.data) || []; });
+  }
+
+  var BUILDING = null;
+  function build(){
+    if(BUILDING) return BUILDING;
+    BUILDING = Promise.all([pull(URL_META), pull(URL_GOOG), pull(URL_ZOHO)]).then(function(res){
+      var meta = res[0], goog = res[1], zoho = res[2];
+      var now = new Date().toISOString();
+
+      /* Hard allow-list. Nothing from the CRM reaches the page unless it is one
+         of these five aggregate fields plus the opaque record id. Personal data
+         — Aadhaar, PAN, passport, blood group, photo, addresses, parents' names,
+         emails and mobiles, disability and medical flags, prior education — is
+         never requested, and is dropped here even if the feed returns it. */
+      var ZOHO_ALLOW = ['date','leads_id','leads_lead_source','leads_lead_status',
+                        'leads_course_interested','leads_course_fee'];
+      zoho = zoho.map(function(r){
+        var clean = {};
+        for(var i=0;i<ZOHO_ALLOW.length;i++){
+          var k = ZOHO_ALLOW[i];
+          if(r && Object.prototype.hasOwnProperty.call(r,k)) clean[k] = r[k];
+        }
+        return clean;
+      });
+
+      /* ---- light.ads: one row per channel per campaign per day ---- */
+      var agg = {};
+      function addAd(src, acct, date, campaign, spend, clicks, imps){
+        if(!date) return;
+        var k = src+'|'+date+'|'+campaign;
+        var a = agg[k];
+        if(!a){ a = agg[k] = { date:date, source:src, account:acct, campaign:campaign,
+                               spend:0, clicks:0, impressions:0, conversions:0 }; }
+        a.spend += spend; a.clicks += clicks; a.impressions += imps;
+      }
+      meta.forEach(function(r){
+        addAd('Meta','MRTPL', d10(r.date), (r.campaign||'').trim()||'(unnamed)',
+              num(r.spend), num(r.clicks), num(r.impressions));
+      });
+      goog.forEach(function(r){
+        addAd('Google','Monolith Academy', d10(r.date), (r.campaign||'').trim()||'(unnamed)',
+              num(r.spend), num(r.clicks), num(r.impressions));
+      });
+      var ads = Object.keys(agg).map(function(k){ return agg[k]; })
+                      .sort(function(a,b){ return a.date < b.date ? -1 : (a.date > b.date ? 1 : 0); });
+
+      /* ---- light.leads + salesIntel (rows pass through 1:1, as the backend did) ---- */
+      var leads = [], records = [], monthly = {}, courseTot = {}, courseRev = {};
+      zoho.slice().sort(function(a,b){ return String(a.date).localeCompare(String(b.date)); })
+      .forEach(function(r){
+        var date = d10(r.date); if(!date) return;
+        var source = (r.leads_lead_source || '').trim() || '(none)';
+        var status = (r.leads_lead_status || '').trim();
+        var course = (r.leads_course_interested || '').trim();
+
+        leads.push({ date:date, source:source, status:status,
+                     course:course, createdTime:date, convertedFlag:(status==='Converted')?'true':'false',
+                     convertedDate:'', courseType:'' });
+
+        var ym = date.slice(0,7);
+        var b = monthly[ym] || (monthly[ym] = { total:0, converted:0, pool:0, phone:0, email:0, jfk:0,
+                                                status:{}, srcLeads:{} });
+        b.total++;
+        b.srcLeads[source] = (b.srcLeads[source]||0) + 1;
+        if(status) b.status[status] = (b.status[status]||0) + 1;
+
+        if(status === 'Converted'){
+          b.converted++;
+          var f = fee(r.leads_course_fee), c = course || '(unspecified)';
+          /* No conversion date exists in this feed (leads_converted_date_time is
+             empty and leads_modified_time is a bulk-edit stamp), so enrolments are
+             dated by LEAD-CREATED date. `cr` is deliberately omitted so the
+             sales-cycle section reports "no data" rather than a false 0 days. */
+          records.push({ d:date, c:c, f:f, s:source });
+          courseTot[c] = (courseTot[c]||0) + 1;
+          courseRev[c] = (courseRev[c]||0) + f;
+        }
+      });
+
+      var byCourse = Object.keys(courseTot).map(function(c){
+        return { course:c, seats:courseTot[c], revenue:courseRev[c]||0 };
+      }).sort(function(a,b){ return b.revenue - a.revenue; });
+      var totalRev = records.reduce(function(s,r){ return s + (r.f||0); }, 0);
+
+      /* ---- detail.adDetail: Meta creative level, monthly + daily series ---- */
+      var dmap = {};
+      meta.forEach(function(r){
+        var date = d10(r.date); if(!date) return;
+        var y = +date.slice(0,4), mo = +date.slice(5,7) - 1;   /* month is 0-based */
+        var campaign = (r.campaign||'').trim()||'(unnamed)';
+        var adSet = (r.adset_name||'').trim()||'(unnamed)';
+        var adName = (r.ad_name||'').trim()||'(unnamed)';
+        var k = campaign+'|'+adSet+'|'+adName+'|'+y+'-'+mo;
+        var e = dmap[k];
+        if(!e){ e = dmap[k] = { campaign:campaign, adSet:adSet, adName:adName,
+                                year:y-2000, month:mo, spend:0, clicks:0, leads:0, impressions:0,
+                                days:[], firstDate:date, lastDate:date }; }
+        e.spend += num(r.spend); e.clicks += num(r.clicks); e.impressions += num(r.impressions);
+        e.days.push({ d:date, s:num(r.spend), c:num(r.clicks), l:0, i:num(r.impressions) });
+        if(date < e.firstDate) e.firstDate = date;
+        if(date > e.lastDate)  e.lastDate  = date;
+      });
+      var adDetail = Object.keys(dmap).map(function(k){ return dmap[k]; });
+
+      /* ---- Meta reach, by month, for the channel cards ---- */
+      var rmap = {};
+      meta.forEach(function(r){
+        var ym = d10(r.date).slice(0,7); if(ym.length !== 7) return;
+        var e = rmap[ym] || (rmap[ym] = { ym:ym, reach:0, imp:0 });
+        e.reach += num(r.reach); e.imp += num(r.impressions);
+      });
+      var adReach = { meta: Object.keys(rmap).map(function(k){ return rmap[k]; }),
+                      google: [], googleReported: false };
+
+      return {
+        light: { fetched_at: now, ads: ads, leads: leads },
+        sales: { fetched_at: now, salesIntel: {
+                   from: '2021-10-08',
+                   monthly: monthly,
+                   enrollment: {
+                     updatedAt: now,
+                     totals: { enrolled: records.length, revenue: totalRev, fullyPaid: 0, partiallyPaid: 0 },
+                     byCourse: byCourse,
+                     byYear: {},
+                     records: records,
+                     cycle: null
+                   }
+                 } },
+        detail: { fetched_at: now, adDetail: adDetail, adDemo: null, adReach: adReach, campMeta: null }
+      };
+    });
+    return BUILDING;
+  }
+
+  function respond(obj){
+    var body = JSON.stringify(obj);
+    return { ok:true, status:200, headers:new Headers(),
+             json:function(){ return Promise.resolve(JSON.parse(body)); },
+             text:function(){ return Promise.resolve(body); } };
+  }
+
+  var realFetch = window.fetch.bind(window);
+  window.fetch = function(input, init){
+    var u = String((input && input.url) || input || '');
+    if(/\/api\/windsor/.test(u)){
+      var part = /part=detail/.test(u) ? 'detail' : (/part=sales/.test(u) ? 'sales' : 'light');
+      if(/fresh=1/.test(u)) BUILDING = null;          /* Refresh re-pulls from Windsor */
+      return build().then(function(d){ return respond(d[part]); })
+                    .catch(function(e){ return { ok:false, status:502,
+                      json:function(){ return Promise.resolve(null); },
+                      text:function(){ return Promise.resolve(String(e)); } }; });
+    }
+    return realFetch(input, init);
+  };
+})();
+</script>
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <style>
