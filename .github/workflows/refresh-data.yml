@@ -1,0 +1,44 @@
+name: Refresh dashboard data
+
+# Pulls the Windsor connectors and commits the pre-aggregated JSON the
+# dashboard reads. The API key lives in the WINDSOR_API_KEY secret and never
+# reaches the published page.
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'     # every 3 hours (UTC)
+  workflow_dispatch:           # and on demand, from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-data
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Fetch connectors and rebuild data
+        env:
+          WINDSOR_API_KEY: ${{ secrets.WINDSOR_API_KEY }}
+        run: node scripts/build-data.mjs
+
+      - name: Commit if the data changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          if git diff --staged --quiet; then
+            echo "No change in the data."
+          else
+            git commit -m "Refresh dashboard data ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
