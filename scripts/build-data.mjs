@@ -27,6 +27,11 @@ const TODAY = new Date().toISOString().slice(0, 10);
 const ZOHO_FIELDS = [
   'date', 'leads_id', 'leads_lead_source', 'leads_lead_status',
   'leads_course_interested', 'leads_course_fee', 'leads_converted_date',
+  // Aggregate attributes of CONVERTED students only, for the "who converts"
+  // card: gender, profession and city. These are the fields the dashboard
+  // charts in aggregate. No name, email, phone, DOB, Aadhaar, PAN, address or
+  // parent contact is requested.
+  'leads_gender', 'leads_profession', 'leads_city',
 ];
 const ZOHO_ALLOW = new Set(ZOHO_FIELDS);
 
@@ -40,7 +45,7 @@ const SOURCES = {
   // (leads / cost-per-lead per creative). Google's `conversions` is deliberately
   // not mapped: it returns every configured conversion action (~74k over two
   // months), which is not a lead count, so Google stays campaign-level only.
-  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend,actions_lead', '2023-10-08'),
+  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend,actions_lead,campaign_start_time,campaign_stop_time,campaign_status,campaign_objective', '2023-10-08'),
   google: url('google_ads', 'date,campaign,clicks,spend,impressions', '2021-10-08'),
   zoho: url('zoho', ZOHO_FIELDS.join(','), '2021-10-08'),
 };
@@ -52,6 +57,11 @@ const d10 = (v) => String(v ?? '').slice(0, 10);
 // Some lead-source labels carry a phone number, e.g.
 // "WhatsApp - Monolith Academy-+918124011190". The number adds nothing to the
 // grouping, so strip it — leads still group under the readable label.
+// "chennai", "Chennai" and "CHENNAI" are one city; title-case so the Top Cities
+// chart doesn't split a place across three bars.
+const titleCase = (v) => String(v ?? '').trim().toLowerCase()
+  .replace(/(^|[\s\-/.])([a-z])/g, (_m, sep, ch) => sep + ch.toUpperCase());
+
 const cleanSource = (v) => String(v ?? '')
   .replace(/\+?\d[\d\s-]{7,}\d/g, '')
   .replace(/[\s\-–—_]+$/, '')
@@ -78,11 +88,22 @@ async function pull(name, u) {
   }
 }
 
+// Meta breakdowns are separate queries: asking for two breakdowns at once
+// multiplies the rows. These are impression aggregates reported by Meta, not
+// individual people, so they carry nothing personal.
+const ADS_FROM = '2023-10-08';
+SOURCES.demo = url('facebook', 'date,age,gender,impressions,clicks,spend,actions_lead', ADS_FROM);
+SOURCES.platform = url('facebook', 'date,publisher_platform,impressions', ADS_FROM);
+SOURCES.placement = url('facebook', 'date,platform_position,impressions', ADS_FROM);
+
 console.log('Fetching Windsor connectors…');
-const [meta, google, zohoRaw] = await Promise.all([
+const [meta, google, zohoRaw, demoRaw, platRaw, placeRaw] = await Promise.all([
   pull('meta', SOURCES.meta),
   pull('google', SOURCES.google),
   pull('zoho', SOURCES.zoho),
+  pull('demo', SOURCES.demo),
+  pull('platform', SOURCES.platform),
+  pull('placement', SOURCES.placement),
 ]);
 
 // Hard allow-list: nothing outside the seven requested fields survives.
@@ -133,7 +154,12 @@ for (const r of [...zoho].sort((a, b) => String(a.date).localeCompare(String(b.d
     const c = course || '(unspecified)';
     // d  = conversion date   -> sales basis (enrolments, seats, revenue booked)
     // ld = lead-created date -> marketing basis (ROAS, revenue-vs-spend, revenue trend)
-    records.push({ d: d10(r.leads_converted_date) || date, ld: date, c, f, s: source });
+    records.push({
+      d: d10(r.leads_converted_date) || date, ld: date, c, f, s: source,
+      g: (r.leads_gender || '').trim(),
+      pr: titleCase(r.leads_profession),
+      ci: titleCase(r.leads_city),
+    });
     courseTot[c] = (courseTot[c] || 0) + 1;
     courseRev[c] = (courseRev[c] || 0) + f;
   }
@@ -165,15 +191,71 @@ for (const r of meta) {
   if (date > e.lastDate) e.lastDate = date;
 }
 
-/* ---- Meta reach by month, for the channel cards ---- */
+/* ---- Campaign metadata: start date, objective and status ----------------
+ * Feeds the "Started" and "Running" columns of the campaign table. Meta
+ * reports these per campaign; Google carries none, so Google rows show "—".
+ * Stop time is only set on campaigns Meta has actually ended.
+ */
+const cmeta = new Map();
+for (const r of meta) {
+  const campaign = (r.campaign || '').trim() || '(unnamed)';
+  const startTime = r.campaign_start_time || '';
+  if (!startTime) continue;
+  const prev = cmeta.get(campaign);
+  // Keep the earliest start seen, and the most recent status/objective.
+  if (!prev || (startTime && startTime < prev.startTime)) {
+    cmeta.set(campaign, {
+      campaign,
+      startTime,
+      stopTime: r.campaign_stop_time || '',
+      status: r.campaign_status || '',
+      objective: r.campaign_objective || '',
+    });
+  } else if (prev && !prev.stopTime && r.campaign_stop_time) {
+    prev.stopTime = r.campaign_stop_time;
+  }
+}
+
+/* ---- Meta reach / platform / placement, by month ------------------------
+ * reachInPeriod() reads adReach.monthly, .platform and .placement, each keyed
+ * by year-month. Platform and placement are rolled up to the month to keep the
+ * committed file small; the reach strip and the Platform/Placement tabs on the
+ * Demographics card read these.
+ */
 const rmap = new Map();
 for (const r of meta) {
   const ym = d10(r.date).slice(0, 7);
   if (ym.length !== 7) continue;
-  const e = rmap.get(ym) ?? { ym, reach: 0, imp: 0 };
-  e.reach += num(r.reach); e.imp += num(r.impressions);
+  const e = rmap.get(ym) ?? { ym, reach: 0, imp: 0, spend: 0 };
+  e.reach += num(r.reach); e.imp += num(r.impressions); e.spend += num(r.spend);
   rmap.set(ym, e);
 }
+
+const rollup = (rows, keyField, outField) => {
+  const m = new Map();
+  for (const r of rows) {
+    const ym = d10(r.date).slice(0, 7);
+    const key = (r[keyField] || 'unknown').toString();
+    if (ym.length !== 7) continue;
+    const k = `${ym}|${key}`;
+    const e = m.get(k) ?? { ym, [outField]: key, imp: 0 };
+    e.imp += num(r.impressions);
+    m.set(k, e);
+  }
+  return [...m.values()];
+};
+const platformRows = rollup(platRaw, 'publisher_platform', 'platform');
+const placementRows = rollup(placeRaw, 'platform_position', 'placement');
+
+/* ---- Ad audience: age x gender, by day (Meta's own impression breakdown) ---- */
+const adDemo = demoRaw.map((r) => ({
+  d: d10(r.date),
+  age: (r.age || 'unknown').toString(),
+  gender: (r.gender || 'unknown').toString(),
+  imp: num(r.impressions),
+  leads: num(r.actions_lead),
+  spend: num(r.spend),
+})).filter((r) => r.d);
 
 /* ---- Pack the two big arrays ----------------------------------------
  * These files are committed on every refresh, so the repo grows by their
@@ -215,9 +297,14 @@ const payloads = {
   detail: {
     fetched_at: now,
     adDetail: [...dmap.values()],
-    adDemo: null,
-    adReach: { meta: [...rmap.values()], google: [], googleReported: false },
-    campMeta: null,
+    adDemo,
+    adReach: {
+      monthly: [...rmap.values()],
+      platform: platformRows,
+      placement: placementRows,
+      google: [], googleReported: false,
+    },
+    campaignMeta: [...cmeta.values()],
   },
 };
 
