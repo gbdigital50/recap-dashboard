@@ -13,7 +13,7 @@
  *
  * Usage: WINDSOR_API_KEY=... node scripts/build-data.mjs
  */
-import { writeFile, mkdir } from 'node:fs/promises';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
 
 const KEY = process.env.WINDSOR_API_KEY;
 if (!KEY) {
@@ -22,6 +22,17 @@ if (!KEY) {
 }
 
 const CONN = 'https://connectors.windsor.ai';
+
+// Meta refuses any date_from beyond 37 months back, and that limit moves
+// forward each day — a fixed start date works until it silently doesn't, which
+// is exactly what broke the refresh. Ask for 36 months to keep a month of
+// headroom. Anything older than this is carried forward from the last run
+// (see the archive merge below) so history is never lost.
+const META_FROM = (() => {
+  const d = new Date();
+  d.setUTCMonth(d.getUTCMonth() - 36);
+  return d.toISOString().slice(0, 10);
+})();
 const TODAY = new Date().toISOString().slice(0, 10);
 
 const ZOHO_FIELDS = [
@@ -45,7 +56,7 @@ const SOURCES = {
   // (leads / cost-per-lead per creative). Google's `conversions` is deliberately
   // not mapped: it returns every configured conversion action (~74k over two
   // months), which is not a lead count, so Google stays campaign-level only.
-  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend,actions_lead,campaign_start_time,campaign_stop_time,campaign_status,campaign_objective', '2023-10-08'),
+  meta: url('facebook', 'date,campaign,adset_name,ad_name,impressions,reach,clicks,spend,actions_lead,campaign_start_time,campaign_stop_time,campaign_status,campaign_objective', META_FROM),
   google: url('google_ads', 'date,campaign,clicks,spend,impressions', '2021-10-08'),
   zoho: url('zoho', ZOHO_FIELDS.join(','), '2021-10-08'),
 };
@@ -91,7 +102,7 @@ async function pull(name, u) {
 // Meta breakdowns are separate queries: asking for two breakdowns at once
 // multiplies the rows. These are impression aggregates reported by Meta, not
 // individual people, so they carry nothing personal.
-const ADS_FROM = '2023-10-08';
+const ADS_FROM = META_FROM;
 SOURCES.demo = url('facebook', 'date,age,gender,impressions,clicks,spend,actions_lead', ADS_FROM);
 SOURCES.platform = url('facebook', 'date,publisher_platform,impressions', ADS_FROM);
 SOURCES.placement = url('facebook', 'date,platform_position,impressions', ADS_FROM);
@@ -231,6 +242,8 @@ for (const r of meta) {
   rmap.set(ym, e);
 }
 
+const reachMonthly = [...rmap.values()];
+
 const rollup = (rows, keyField, outField) => {
   const m = new Map();
   for (const r of rows) {
@@ -244,11 +257,11 @@ const rollup = (rows, keyField, outField) => {
   }
   return [...m.values()];
 };
-const platformRows = rollup(platRaw, 'publisher_platform', 'platform');
-const placementRows = rollup(placeRaw, 'platform_position', 'placement');
+let platformRows = rollup(platRaw, 'publisher_platform', 'platform');
+let placementRows = rollup(placeRaw, 'platform_position', 'placement');
 
 /* ---- Ad audience: age x gender, by day (Meta's own impression breakdown) ---- */
-const adDemo = demoRaw.map((r) => ({
+let adDemo = demoRaw.map((r) => ({
   d: d10(r.date),
   age: (r.age || 'unknown').toString(),
   gender: (r.gender || 'unknown').toString(),
@@ -256,6 +269,60 @@ const adDemo = demoRaw.map((r) => ({
   leads: num(r.actions_lead),
   spend: num(r.spend),
 })).filter((r) => r.d);
+
+/* ---- Carry forward history older than Meta's window ---------------------
+ * Meta will not serve data older than ~37 months, and that cut-off advances
+ * daily. Everything already committed from earlier runs is still good, so the
+ * rows that now fall outside the window are merged back in from the previous
+ * data files. Without this the dashboard would quietly lose a month of Meta
+ * history every month while still showing "all time".
+ */
+const readPrev = async (name) => {
+  try { return JSON.parse(await readFile(`data/${name}.json`, 'utf8')); }
+  catch { return null; }
+};
+const unpackAds = (packed) => !packed ? [] : packed.r.map((x) => ({
+  date: packed.d[x[0]], source: packed.s[x[1]], account: packed.a[x[2]],
+  campaign: packed.c[x[3]], spend: x[4], clicks: x[5], impressions: x[6], conversions: 0,
+}));
+
+const prevLight = await readPrev('light');
+const prevDetail = await readPrev('detail');
+const WIN_YM = META_FROM.slice(0, 7);
+let carried = { ads: 0, detail: 0, demo: 0, reach: 0, meta: 0 };
+
+if (prevLight) {
+  // Only Meta is windowed; Google and the CRM still return their full history.
+  const old = unpackAds(prevLight.adsPacked).filter((a) => a.source === 'Meta' && a.date < META_FROM);
+  if (old.length) { ads.unshift(...old); ads.sort((a, b) => a.date.localeCompare(b.date)); carried.ads = old.length; }
+}
+if (prevDetail) {
+  const ymOf = (e) => `${2000 + e.year}-${String(e.month + 1).padStart(2, '0')}`;
+  // adDetail is produced from dmap at write time, so older creatives are merged
+  // back into the map under the same key the live rows use.
+  for (const e of (prevDetail.adDetail || [])) {
+    if (ymOf(e) >= WIN_YM) continue;
+    const k = `${e.campaign}|${e.adSet}|${e.adName}|${2000 + e.year}-${e.month}`;
+    if (!dmap.has(k)) { dmap.set(k, e); carried.detail++; }
+  }
+
+  const oldDemo = (prevDetail.adDemo || []).filter((r) => r.d < META_FROM);
+  if (oldDemo.length) { adDemo.unshift(...oldDemo); carried.demo = oldDemo.length; }
+
+  const pr = prevDetail.adReach || {};
+  const keepOld = (rows) => (rows || []).filter((r) => r.ym < WIN_YM);
+  const oldMonthly = keepOld(pr.monthly), oldPlat = keepOld(pr.platform), oldPlace = keepOld(pr.placement);
+  reachMonthly.unshift(...oldMonthly);
+  platformRows.unshift(...oldPlat);
+  placementRows.unshift(...oldPlace);
+  carried.reach = oldMonthly.length + oldPlat.length + oldPlace.length;
+
+  // Campaigns that stopped running before the window still belong in the table.
+  for (const c of (prevDetail.campaignMeta || [])) {
+    if (!cmeta.has(c.campaign)) { cmeta.set(c.campaign, c); carried.meta++; }
+  }
+}
+console.log(`  carried forward from the previous run: ${carried.ads} ad-days, ${carried.detail} creatives, ${carried.demo} audience rows, ${carried.reach} reach rows, ${carried.meta} campaigns`);
 
 /* ---- Pack the two big arrays ----------------------------------------
  * These files are committed on every refresh, so the repo grows by their
@@ -299,7 +366,7 @@ const payloads = {
     adDetail: [...dmap.values()],
     adDemo,
     adReach: {
-      monthly: [...rmap.values()],
+      monthly: reachMonthly,
       platform: platformRows,
       placement: placementRows,
       google: [], googleReported: false,
